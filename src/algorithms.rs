@@ -2,6 +2,7 @@ use alloc::vec;
 use digest::DynDigest;
 use num_bigint::traits::ModInverse;
 use num_bigint::{BigUint, RandPrime};
+use num_integer::Integer;
 #[allow(unused_imports)]
 use num_traits::Float;
 use num_traits::{FromPrimitive, One, Zero};
@@ -137,6 +138,46 @@ pub fn generate_multi_prime_key_with_exp<R: Rng>(
         d_final,
         primes,
     ))
+}
+
+/// Generates a RSA private key which supports exponent based signature
+/// transformation. Generates instances of RSA private key with given parameters
+/// and checks if mod inverse for used exponent public key exists or not in the
+/// totient group? Accordingly, calculates the signature transformation exponent
+/// "t".
+pub fn transform_rsa_key<R: Rng>(
+    rng: &mut R,
+    bit_size: usize,
+    e_used: &BigUint,
+    e_supported: &BigUint,
+) -> (RsaPrivateKey, BigUint) {
+    let d1_final: BigUint;
+    let t: BigUint;
+    let rsa_priv_key_final_used: RsaPrivateKey;
+
+    'next: loop {
+        let rsa_priv_key =
+            RsaPrivateKey::new_with_exp(rng, bit_size, e_used).expect("Failed generating key");
+        let primes = rsa_priv_key.primes();
+        let mut totient = BigUint::one();
+        let mut n = BigUint::one();
+
+        for prime in primes {
+            n *= prime;
+            totient *= prime - BigUint::one();
+        }
+        // Since the inverse of e_used exponent already exists, we need to find if the
+        // inverse of e_supported also exists with same module inverse?
+        if let Some(d1) = e_supported.mod_inverse(totient.clone()) {
+            d1_final = d1.to_biguint().unwrap();
+            rsa_priv_key_final_used = rsa_priv_key;
+            t = (e_used * d1_final).mod_floor(&totient);
+            break;
+        } else {
+            continue 'next;
+        }
+    }
+    (rsa_priv_key_final_used, t)
 }
 
 /// Mask generation function.

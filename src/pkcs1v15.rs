@@ -1,11 +1,15 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use rand::prelude::StdRng;
 use rand::Rng;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 use crate::errors::{Error, Result};
 use crate::hash::Hash;
-use crate::key::{self, PrivateKey, PublicKey};
+use crate::key::PublicKeyParts;
+use crate::key::{self, PrivateKey, PublicKey, RsaPrivateKey};
+
+use crate::raw::raw_decryption_primitive_no_check;
 
 // Encrypts the given message with RSA and the padding
 // scheme from PKCS#1 v1.5.  The message must be no longer than the
@@ -90,6 +94,11 @@ pub fn sign<R: Rng, SK: PrivateKey>(
     em[k - hash_len..k].copy_from_slice(hashed);
 
     priv_key.raw_decryption_primitive(rng, &em, priv_key.size())
+}
+
+#[inline]
+pub(crate) fn sign_cipher(priv_key: &RsaPrivateKey, cipher: &[u8]) -> Result<Vec<u8>> {
+    raw_decryption_primitive_no_check::<StdRng>(priv_key, None, cipher, priv_key.size())
 }
 
 /// Verifies an RSA PKCS#1 v1.5 signature.
@@ -221,7 +230,10 @@ mod tests {
     use sha1::{Digest, Sha1};
     use std::time::SystemTime;
 
+    use crate::key::TransformedRsaPrivateKey;
     use crate::{Hash, PaddingScheme, PublicKey, PublicKeyParts, RsaPrivateKey, RsaPublicKey};
+    use rand_chacha::ChaCha20Rng;
+    use sha2::Sha256;
 
     #[test]
     fn test_non_zero_bytes() {
@@ -346,6 +358,98 @@ mod tests {
                 .unwrap();
             assert_eq!(out2, expected);
         }
+    }
+
+    pub fn generate_rsa_key() -> RsaPrivateKey {
+        let seed = rand::thread_rng().gen::<[u8; 32]>();
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let priv_key: RsaPrivateKey =
+            RsaPrivateKey::new_with_exp(&mut rng, 2048, &BigUint::from_u64(65537).unwrap())
+                .expect("Err in key gen.");
+        priv_key
+    }
+
+    #[test]
+    pub fn test_generate_rsa_key() {
+        generate_rsa_key();
+    }
+
+    #[test]
+    pub fn multiple_iterations_test_for_rsa_key_generation() {
+        for _ in 0..256 {
+            generate_rsa_key();
+        }
+    }
+
+    pub fn generate_transform_rsa_key() -> TransformedRsaPrivateKey {
+        let seed = rand::thread_rng().gen::<[u8; 32]>();
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let priv_key: TransformedRsaPrivateKey = TransformedRsaPrivateKey::new_with_rng(
+            &mut rng,
+            2048,
+            &BigUint::from_u64(65537).unwrap(),
+            BigUint::from_u64(3).unwrap(),
+        )
+        .expect("Err in key gen.");
+        priv_key
+    }
+
+    #[test]
+    pub fn test_generate_transform_rsa_key() {
+        generate_transform_rsa_key();
+    }
+
+    #[test]
+    pub fn multiple_iterations_test_for_transform_rsa_key_generation() {
+        for _ in 0..256 {
+            generate_transform_rsa_key();
+        }
+    }
+
+    #[test]
+    fn test_sign_pkcs1v15_with_transformed_rsa_key() {
+        let priv_key: TransformedRsaPrivateKey = generate_transform_rsa_key();
+        let message = "Test.\n";
+        let digest = Sha256::digest(message.as_bytes()).to_vec();
+
+        let out = priv_key
+            .sign(
+                PaddingScheme::new_pkcs1v15_sign(Some(Hash::SHA2_256)),
+                &digest,
+            )
+            .expect("Err in signing");
+
+        let pub_key = priv_key.get_supported_pub_key_component();
+        pub_key
+            .verify(
+                PaddingScheme::new_pkcs1v15_sign(Some(Hash::SHA2_256)),
+                &digest,
+                &out,
+            )
+            .expect("failed to verify");
+    }
+
+    #[test]
+    fn test_sign_pkcs1v15_with_rsa_key() {
+        let priv_key: RsaPrivateKey = generate_rsa_key();
+        let message = "Test.\n";
+        let digest = Sha256::digest(message.as_bytes()).to_vec();
+
+        let out = priv_key
+            .sign(
+                PaddingScheme::new_pkcs1v15_sign(Some(Hash::SHA2_256)),
+                &digest,
+            )
+            .expect("Err in signing");
+
+        let pub_key = priv_key.to_public_key();
+        pub_key
+            .verify(
+                PaddingScheme::new_pkcs1v15_sign(Some(Hash::SHA2_256)),
+                &digest,
+                &out,
+            )
+            .expect("failed to verify");
     }
 
     #[test]

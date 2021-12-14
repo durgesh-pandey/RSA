@@ -3,14 +3,17 @@ use core::ops::Deref;
 use num_bigint::traits::ModInverse;
 use num_bigint::Sign::Plus;
 use num_bigint::{BigInt, BigUint};
-use num_traits::{One, ToPrimitive};
+use num_traits::{FromPrimitive, One, ToPrimitive};
 use rand::{rngs::StdRng, Rng};
 #[cfg(feature = "serde")]
 use serde_crate::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
-use crate::algorithms::{generate_multi_prime_key, generate_multi_prime_key_with_exp};
+use crate::algorithms::{
+    generate_multi_prime_key, generate_multi_prime_key_with_exp, transform_rsa_key,
+};
 use crate::errors::{Error, Result};
+use crate::pkcs1v15::sign_cipher;
 
 use crate::padding::PaddingScheme;
 use crate::raw::{DecryptionPrimitive, EncryptionPrimitive};
@@ -64,6 +67,19 @@ pub struct RsaPrivateKey {
     /// precomputed values to speed up private operations
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) precomputed: Option<PrecomputedValues>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransformedRsaPrivateKey {
+    /// RSA private key in which we want to transform our signature.
+    /// This key has pub key which is supported by the target,
+    /// and private key which is used for signature transformation.
+    pub rsa_priv_key_supported: RsaPrivateKey,
+    /// RSA private key we used for signing: The key, in which original
+    /// signature was generated.
+    pub rsa_priv_key_used: RsaPrivateKey,
+    /// key transformation exponent
+    pub(crate) t: BigUint,
 }
 
 impl PartialEq for RsaPrivateKey {
@@ -368,6 +384,11 @@ impl RsaPrivateKey {
         &self.primes
     }
 
+    fn clear_precomputed(key: RsaPrivateKey) -> RsaPrivateKey {
+        let mut key1 = key;
+        key1.precomputed = None;
+        key1
+    }
     /// Performs basic sanity checks on the key.
     /// Returns `Ok(())` if everything is good, otherwise an approriate error.
     pub fn validate(&self) -> Result<()> {
@@ -506,10 +527,121 @@ impl RsaPrivateKey {
     }
 }
 
+impl TransformedRsaPrivateKey {
+    pub fn new(
+        priv_key: RsaPrivateKey,
+        exp_used: &BigUint,
+        exp_supported: BigUint,
+        t: BigUint,
+    ) -> TransformedRsaPrivateKey {
+        // This key is a valid RSA key in it's own with corresponding pub key (e_used,
+        // n) but it is also a part of RSA key (e_supported, n).
+        // Passing original primes as it is be used as it can further be processed in
+        // features like distributed signing.
+        let rsa_priv_key_used = RsaPrivateKey::from_components(
+            priv_key.n().clone(),
+            exp_used.clone(),
+            priv_key.d().clone(),
+            priv_key.primes().to_vec(),
+        );
+
+        // Note: The below instance of the supported RSA key is not a valid key but has
+        // same structure as a valid RSA private key. Since this is only used in
+        // signature transformation and not in recovery or any other feature which
+        // requires the original prime vectors, prime field is populated with
+        // fake primes (implementation assumes nprime = 2).
+        let primes: Vec<BigUint> =
+            [BigUint::from_u8(11).unwrap(), BigUint::from_u8(17).unwrap()].to_vec();
+        let rsa_priv_key_supported =
+            RsaPrivateKey::from_components(priv_key.n().clone(), exp_supported, t.clone(), primes);
+
+        // Clear precomputed values that are generated with the fake primes
+        let rsa_priv_key_used = RsaPrivateKey::clear_precomputed(rsa_priv_key_used);
+        let rsa_priv_key_supported = RsaPrivateKey::clear_precomputed(rsa_priv_key_supported);
+
+        // Note :
+        // Case 1:
+        // Not to ever reveal the used priv key public exponent i.e. e_used, if t is
+        // kept public. which is the approach mentioned in [1]: RSA signatures
+        // under hardware restrictions.
+        //
+        // Case 2:
+        // "t" is also kept secret as private exponent of the supported RSA key i.e. d =
+        // t. In this case, The transformation scheme can also be seen as a two
+        // party threshold key scheme. Where, original private key exponent is
+        // inverse of pub exponent e_supported i.e. d_supported = e_supported ^
+        // -1 mod phi(n) and d_supported = t * d_used mod phi(n)
+        // So if t and d_used, both is kept secret, it's has two party threshold RSA key
+        // property.
+        TransformedRsaPrivateKey {
+            rsa_priv_key_used,
+            rsa_priv_key_supported,
+            t,
+        }
+    }
+
+    /// Generate a new Transformed RSA key of the given bit size using the
+    /// passed in `rng`.
+    pub fn new_with_rng<R: Rng>(
+        rng: &mut R,
+        bit_size: usize,
+        exp_used: &BigUint,
+        exp_supported: BigUint,
+    ) -> Result<TransformedRsaPrivateKey> {
+        let (rsa_priv_key, t) = transform_rsa_key(rng, bit_size, exp_used, &exp_supported);
+        Ok(Self::new(rsa_priv_key, exp_used, exp_supported, t))
+    }
+
+    /// Get transformation exponent `t`
+    pub fn t(&self) -> &BigUint {
+        &self.t
+    }
+
+    pub fn get_supported_pub_key_component(&self) -> RsaPublicKey {
+        (&*self.rsa_priv_key_supported).clone()
+    }
+
+    /// steps for signing :
+    /// - perform initial signing with choice key with default padding scheme.
+    /// - then perform signing of the output with no padding scheme with rsa key
+    ///   of supported.
+    /// - Note, the output of the first should be compatible with the input of
+    ///   second.
+    pub fn sign(&self, padding: PaddingScheme, digest_in: &[u8]) -> Result<Vec<u8>> {
+        let choice_key_sign = match padding {
+            // need to pass any Rng as the type arg, so the type checker is happy, it is not
+            // actually used for anything
+            padding @ PaddingScheme::PKCS1v15Sign { .. } => {
+                self.rsa_priv_key_used.sign(padding, digest_in)
+            }
+            padding @ PaddingScheme::PSS { .. } => self.rsa_priv_key_used.sign(padding, digest_in),
+            _ => return Err(Error::InvalidPaddingScheme),
+        }?;
+
+        let final_sig = sign_cipher(&self.rsa_priv_key_supported, &choice_key_sign)?;
+        Ok(final_sig)
+    }
+}
+
+/// Transform a signature using the provided supported key
+pub fn transform_signature(supported_key: &RsaPrivateKey, sig: &[u8]) -> Result<Vec<u8>> {
+    let priv_key = RsaPrivateKey::clear_precomputed(supported_key.clone());
+    sign_cipher(&priv_key, sig)
+}
+
+//#[inline]
+//fn clear_precomputed(key: RsaPrivateKey) -> RsaPrivateKey {
+//    let ser = bincode::serialize(&key).expect("serialized key");
+//    bincode::deserialize(&ser).expect("deserialized key")
+//}
+
 /// Check that the public key is well formed and has an exponent within acceptable bounds.
 #[inline]
 pub fn check_public(public_key: &impl PublicKeyParts) -> Result<()> {
-    let public_key = public_key.e().to_u64().ok_or(Error::PublicExponentTooLarge)?;
+    let public_key = public_key
+        .e()
+        .to_u64()
+        .ok_or(Error::PublicExponentTooLarge)?;
 
     if public_key < MIN_PUB_EXPONENT {
         return Err(Error::PublicExponentTooSmall);

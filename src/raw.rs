@@ -12,6 +12,25 @@ pub trait EncryptionPrimitive {
     fn raw_encryption_primitive(&self, plaintext: &[u8], pad_size: usize) -> Result<Vec<u8>>;
 }
 
+// Can't access DecryptionPrimitive trait (yet?), so no way to implement it
+pub(crate) fn raw_decryption_primitive_no_check<R: Rng>(
+    key: &RsaPrivateKey,
+    rng: Option<&mut R>,
+    ciphertext: &[u8],
+    pad_size: usize,
+) -> Result<Vec<u8>> {
+    let mut c = BigUint::from_bytes_be(ciphertext);
+    let mut m = internals::decrypt(rng, key, &c)?;
+    let mut m_bytes = m.to_bytes_be();
+    let plaintext = internals::left_pad(&m_bytes, pad_size);
+    // clear tmp values
+    c.zeroize();
+    m.zeroize();
+    m_bytes.zeroize();
+
+    Ok(plaintext)
+}
+
 pub trait DecryptionPrimitive {
     /// Do NOT use directly! Only for implementors.
     fn raw_decryption_primitive<R: Rng>(
